@@ -1,91 +1,94 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import Any, Dict
-import httpx
-from bs4 import BeautifulSoup
+import uvicorn
 
-from a2a_common import get_text_from_a2a, a2a_response, a2a_error
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 
-app = FastAPI(title="Place Search Agent")
-
-
-class A2ARequest(BaseModel):
-    jsonrpc: str = "2.0"
-    id: str | int | None = None
-    method: str
-    params: Dict[str, Any]
+from common import ask_llm, ask_llm_json, duckduckgo_search, get_user_text, send_a2a_text
 
 
-@app.get("/.well-known/agent.json")
-def agent_card():
-    return {
-        "name": "Place Search Agent",
-        "description": "웹 검색 기반으로 장소 정보를 검색하는 Agent",
-        "url": "http://localhost:8001/message/send",
-        "version": "0.1.0",
-        "capabilities": {
-            "streaming": False,
-            "pushNotifications": False
-        },
-        "skills": [
-            {
-                "id": "search_place",
-                "name": "Search Place",
-                "description": "장소명, 관광지, 주변 장소 정보를 웹 검색으로 찾는다.",
-                "inputModes": ["text/plain"],
-                "outputModes": ["text/plain"]
-            }
-        ]
-    }
+class PlaceAgentExecutor(AgentExecutor):
+    async def execute(self, context: RequestContext, event_queue: EventQueue):
+        user_question = get_user_text(context)
 
+        plan = await ask_llm_json(
+            system_prompt="""
+너는 장소 추천 Agent다.
+사용자 질문을 보고 DuckDuckGo 검색에 적합한 검색어를 JSON으로 만들어라.
+반드시 JSON만 반환해라.
+""",
+            user_prompt=f"""
+사용자 질문:
+{user_question}
 
-async def search_duckduckgo(query: str) -> str:
-    url = "https://html.duckduckgo.com/html/"
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+반환 형식:
+{{
+  "search_query": "검색어",
+  "user_intent": "사용자 의도 요약"
+}}
+"""
+        )
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        res = await client.post(url, data={"q": query}, headers=headers)
+        search_query = plan["search_query"]
+        search_result = await duckduckgo_search(search_query)
 
-    soup = BeautifulSoup(res.text, "html.parser")
-    results = []
+        answer = await ask_llm(
+            system_prompt="""
+너는 웹 검색 결과를 바탕으로 장소를 추천하는 Agent다.
+검색 결과에 없는 내용은 추측하지 마라.
+한국어로 답변해라.
+""",
+            user_prompt=f"""
+사용자 질문:
+{user_question}
 
-    for item in soup.select(".result")[:5]:
-        title_el = item.select_one(".result__title")
-        snippet_el = item.select_one(".result__snippet")
+검색어:
+{search_query}
 
-        title = title_el.get_text(" ", strip=True) if title_el else ""
-        snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+DuckDuckGo 검색 결과:
+{search_result}
 
-        if title:
-            results.append(f"- {title}\n  {snippet}")
+위 검색 결과를 바탕으로 적절한 장소를 추천해라.
+"""
+        )
 
-    if not results:
-        return "검색 결과를 찾지 못했습니다."
+        await send_a2a_text(event_queue, answer)
 
-    return "\n".join(results)
-
-
-@app.post("/message/send")
-async def message_send(req: A2ARequest):
-    print("[Search Place Agent Called]")
-    if req.method != "message/send":
-        return a2a_error("지원하지 않는 method 입니다.", req.id)
-
-    user_text = get_text_from_a2a(req.model_dump())
-    query = f"{user_text} 장소 관광지 위치 주변 정보"
-
-    result = await search_duckduckgo(query)
-
-    return a2a_response(
-        f"[Place Agent 검색 결과]\n질문: {user_text}\n\n{result}",
-        req.id
-    )
-
-def main():
-    print("Hello from search-place-agent!")
+    async def cancel(self, context: RequestContext, event_queue: EventQueue):
+        raise Exception("cancel not supported")
 
 
 if __name__ == "__main__":
-    main()
+    skill = AgentSkill(
+        id="place_recommendation",
+        name="Place Recommendation",
+        description="DuckDuckGo 검색 Tool과 LLM을 활용해 사용자 질문에 맞는 장소를 추천한다.",
+        tags=["place", "search", "recommendation"],
+        examples=["강릉에서 비 오는 날 갈만한 곳 추천해줘"],
+    )
+
+    agent_card = AgentCard(
+        name="Place Agent",
+        description="웹 검색 기반 장소 추천 Agent",
+        url="http://localhost:8001/",
+        version="1.0.0",
+        capabilities=AgentCapabilities(streaming=False),
+        default_input_modes=["text"],
+        default_output_modes=["text"],
+        skills=[skill],
+    )
+
+    handler = DefaultRequestHandler(
+        agent_executor=PlaceAgentExecutor(),
+        task_store=InMemoryTaskStore(),
+    )
+
+    app = A2AStarletteApplication(
+        agent_card=agent_card,
+        http_handler=handler,
+    )
+
+    uvicorn.run(app.build(), host="0.0.0.0", port=8001)
