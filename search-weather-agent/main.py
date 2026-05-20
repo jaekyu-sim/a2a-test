@@ -1,89 +1,98 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import Any, Dict
-import httpx
+import uvicorn
 
-from a2a_common import get_text_from_a2a, a2a_response, a2a_error
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 
-
-app = FastAPI(title="Weather Search Agent")
-
-class A2ARequest(BaseModel):
-    jsonrpc: str = "2.0"
-    id: str | int | None = None
-    method: str
-    params: Dict[str, Any]
+from common import ask_llm, ask_llm_json, duckduckgo_search, get_user_text, send_a2a_text
 
 
-@app.get("/.well-known/agent.json")
-def agent_card():
-    return {
-        "name": "Weather Search Agent",
-        "description": "웹 기반 날씨 정보를 조회하는 Agent",
-        "url": "http://localhost:8002/message/send",
-        "version": "0.1.0",
-        "capabilities": {
-            "streaming": False,
-            "pushNotifications": False
-        },
-        "skills": [
-            {
-                "id": "search_weather",
-                "name": "Search Weather",
-                "description": "지역명을 받아 현재 날씨와 예보를 조회한다.",
-                "inputModes": ["text/plain"],
-                "outputModes": ["text/plain"]
-            }
-        ]
-    }
+class WeatherAgentExecutor(AgentExecutor):
+    async def execute(self, context: RequestContext, event_queue: EventQueue):
+        user_question = get_user_text(context)
 
+        plan = await ask_llm_json(
+            system_prompt="""
+너는 날씨 검색 Agent다.
+사용자 질문을 보고 DuckDuckGo에서 날씨를 검색하기 위한 검색어를 JSON으로 만들어라.
+지역명, 날짜 표현, 날씨 의도를 자유롭게 추론해라.
+반드시 JSON만 반환해라.
+""",
+            user_prompt=f"""
+사용자 질문:
+{user_question}
 
-async def get_weather(location: str) -> str:
-    url = f"https://wttr.in/{location}?format=j1"
+반환 형식:
+{{
+  "search_query": "검색어",
+  "location": "추론한 지역",
+  "date": "추론한 날짜 표현",
+  "user_intent": "사용자 의도 요약"
+}}
+"""
+        )
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        res = await client.get(url)
+        search_query = plan["search_query"]
+        search_result = await duckduckgo_search(search_query)
 
-    data = res.json()
-    current = data["current_condition"][0]
-    area = data.get("nearest_area", [{}])[0]
+        answer = await ask_llm(
+            system_prompt="""
+너는 웹 검색 결과를 바탕으로 날씨를 알려주는 Agent다.
+검색 결과에 없는 날씨 정보는 추측하지 마라.
+강수 여부, 기온, 체감상 주의사항이 있으면 요약해라.
+한국어로 답변해라.
+""",
+            user_prompt=f"""
+사용자 질문:
+{user_question}
 
-    area_name = area.get("areaName", [{"value": location}])[0]["value"]
-    country = area.get("country", [{"value": ""}])[0]["value"]
+LLM이 만든 검색 계획:
+{plan}
 
-    temp = current.get("temp_C")
-    feels = current.get("FeelsLikeC")
-    humidity = current.get("humidity")
-    desc = current.get("weatherDesc", [{"value": ""}])[0]["value"]
-    wind = current.get("windspeedKmph")
+DuckDuckGo 검색 결과:
+{search_result}
 
-    return f"""
-지역: {area_name}, {country}
-현재 날씨: {desc}
-기온: {temp}℃
-체감온도: {feels}℃
-습도: {humidity}%
-풍속: {wind} km/h
-""".strip()
+위 검색 결과를 바탕으로 날씨 답변을 작성해라.
+"""
+        )
 
+        await send_a2a_text(event_queue, answer)
 
-@app.post("/message/send")
-async def message_send(req: A2ARequest):
-    print("[Search Weather Agent Called]")
-    if req.method != "message/send":
-        return a2a_error("지원하지 않는 method 입니다.", req.id)
-
-    user_text = get_text_from_a2a(req.model_dump())
-    result = await get_weather(user_text)
-
-    return a2a_response(
-        f"[Weather Agent 검색 결과]\n질문: {user_text}\n\n{result}",
-        req.id
-    )
-
-def main():
-    print("Hello from search-weather-agent!")
+    async def cancel(self, context: RequestContext, event_queue: EventQueue):
+        raise Exception("cancel not supported")
 
 
 if __name__ == "__main__":
-    main()
+    skill = AgentSkill(
+        id="weather_search",
+        name="Weather Search",
+        description="DuckDuckGo 검색 Tool과 LLM을 활용해 사용자 질문에 맞는 지역 날씨를 알려준다.",
+        tags=["weather", "search"],
+        examples=["이번 주말 강릉 날씨 알려줘"],
+    )
+
+    agent_card = AgentCard(
+        name="Weather Agent",
+        description="웹 검색 기반 날씨 Agent",
+        url="http://localhost:8002/",
+        version="1.0.0",
+        capabilities=AgentCapabilities(streaming=False),
+        default_input_modes=["text"],
+        default_output_modes=["text"],
+        skills=[skill],
+    )
+
+    handler = DefaultRequestHandler(
+        agent_executor=WeatherAgentExecutor(),
+        task_store=InMemoryTaskStore(),
+    )
+
+    app = A2AStarletteApplication(
+        agent_card=agent_card,
+        http_handler=handler,
+    )
+
+    uvicorn.run(app.build(), host="0.0.0.0", port=8002)
